@@ -103,6 +103,28 @@ class hullWhite:
         return self.FwdRatePartial(T) + self.kappa*self.FwdRate(T) + \
             self.sig**2/2./self.kappa * (1-np.exp(-2*self.kappa*T))
 
+    def getMC(self, r_t, T, t=0):
+        """
+        Return a function for Monte Carlo simulations.
+
+        parameters --
+        r_t: initial starting short rate
+        T:  terminal time
+        t: staring time, by defult = 0
+        """
+        def __wrapper(_z):  # _z should be 1d array of normal random variable
+            __dt = (T-t)/len(_z)
+            __time_stpes = np.linspace(t, T, len(_z)+1)  # time space
+            __r_s = np.repeat(r_t, len(_z)+1)  # r_t space
+
+            for _i, _z_i in enumerate(_z):
+                __r_s[_i+1] = __r_s[_i]+(self.getTheta(__time_stpes[_i+1]) -
+                                         self.kappa*__r_s[_i]) * \
+                        __dt + self.sig * __dt**0.5 * _z_i
+            return __r_s
+
+        return __wrapper
+
 
 def basisExpansion(data, power):
     """
@@ -166,3 +188,70 @@ def calCapletPrice(sig, T, dt, getZ, r_k, N=1):
 
     return _M*(_K*getZ(T-dt)*scipy.stats.norm.cdf(_d1) -
                getZ(T)*scipy.stats.norm.cdf(_d2))
+
+
+def multiStepMC(z, price_evolution, anti=False,
+                tracker=lambda S_ts: S_ts):
+    """
+    A very generic version of multi-stps Monte Carlo.
+
+    Assumptions:
+    - THE STEPS IS DETERMINED BY THE DIMENSION OF Z (which is a np.ndarray)
+    - Equally spaced time stpes
+
+    Parameters:
+    z:               A m by n numpy matrix. We assume m is the number of
+                     simulations and n is the time stpes
+
+    price_evolution: A function that takes a 1d array of Z slice and
+                     returns a 1d array (+1 size to include initial point)
+                     of the evlotion of underlyings which based on the Zs
+
+    tracker:         A function (takes an array of evolution of underlyings)
+                     that keep track of features of the price evolution,
+                     which could be max/min, or whether a boundary is hitted,
+
+    anti:            whether you want the anti-variate version of the MC.
+                     If ture, will ONLY RETURN the ANTI part.
+
+    The function will return a tuple of both the price evolutions and the
+    tracked values time series, which are both m by (n+1), which include the
+    initial point of the price at t=0.
+    """
+    if anti:
+        z = -z
+
+    # generate the evolution of underlyings for all pathes
+    _evolutions = np.apply_along_axis(price_evolution, 1, z)
+
+    return _evolutions, np.apply_along_axis(tracker, 1, _evolutions)
+
+
+def cashFlowMCSummary(CFs, Zs, Z_ups, Z_downs, shock):
+    """
+    A very tailored function for HW1 Q2.
+
+    Parameters:
+    CFs : undiscounted cash flow of a security
+    Zs  : a m by n array of MC simulated discount factors
+    Z_ups, Z_downs, shock: shocked Zs and shock
+
+    Will return a list of:
+    [Mean, SE, Effective Duration, Convexity]
+    """
+    # pathwise results
+    _path_results = np.apply_along_axis(np.dot, 1, Zs, CFs)
+    _path_results_up = np.apply_along_axis(np.dot, 1, Z_ups, CFs)
+    _path_results_down = np.apply_along_axis(np.dot, 1, Z_downs, CFs)
+
+    _mean = _path_results.mean()
+    _se = scipy.stats.sem(_path_results)
+
+    _duration = (_path_results_up.mean()-_path_results_down.mean()) / \
+        (_mean*2*shock)
+
+    _convexity = (_path_results_up.mean() +
+                  _path_results_down.mean() - 2*_mean) / \
+        (_mean*shock**2)
+
+    return [_mean, _se, _duration, _convexity]
