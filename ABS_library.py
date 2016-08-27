@@ -36,12 +36,13 @@ class hullWhite:
 
     def __init__(self, FwdRate=lambda T: T,
                  FwdRatePartial=lambda T: T,
-                 kappa=0.1, sig=0.1):
+                 kappa=0.1, sig=0.1, short_rate=0.05):
         """Initialization of the class."""
         self.kappa = kappa
         self.sig = sig
         self.FwdRate = FwdRate
         self.FwdRatePartial = FwdRatePartial
+        self.short_rate = short_rate
 
     def setKappa(self, kappa):
         """Set Kappa."""
@@ -59,6 +60,10 @@ class hullWhite:
         """Set Fwd Rate Partial."""
         self.FwdRatePartial = FwdRatePartial
 
+    def setShortRate(self, short_rate):
+        """Set short rate."""
+        self.short_rate = short_rate
+
     def getOptionVol(self, T_O, T_B, t=0):
         """
         Calculate the option volatility.
@@ -69,14 +74,19 @@ class hullWhite:
         t  : current time
         """
         _part1 = self.sig**2*(1-np.exp(-2*self.kappa*(T_O-t)))/2/self.kappa
-        _part2 = np.power(1-np.exp(self.kappa*(T_B-T_O)), 2)/self.kappa**2
-
+        _part2 = np.power(1-np.exp(-self.kappa*(T_B-T_O)), 2)/self.kappa**2
         return np.power(_part1 * _part2, 0.5)
 
     def getA(self, t, T):
         """Get A."""
-        _term1 = -scipy.integrate.quad(lambda tau: self.getB(tau, T) *
-                                       self.getTheta(tau), t, T)[0]
+        if(type(T) != float):
+            _term1 = np.array([-scipy.integrate.quad(
+                lambda tau: self.getB(tau, _T) * self.getTheta(tau), t, _T)[0]
+                for _T in T])
+        else:
+            _term1 = -scipy.integrate.quad(
+                lambda tau: self.getB(tau, T) * self.getTheta(tau), t, T)[0]
+
         _term2 = self.sig**2/2/self.kappa**2 * \
             (T-t+(1-np.exp(-2*self.kappa*(T-t)))/2/self.kappa -
              2 * self.getB(t, T))
@@ -103,6 +113,11 @@ class hullWhite:
         return self.FwdRatePartial(T) + self.kappa*self.FwdRate(T) + \
             self.sig**2/2./self.kappa * (1-np.exp(-2*self.kappa*T))
 
+    def getZ(self, t=0):
+        """Return a function for discount Curve."""
+        return lambda T: np.exp(self.getA(t, T) -
+                                self.getB(t, T) * self.short_rate)
+
     def getMC(self, r_t, T, t=0):
         """
         Return a function for Monte Carlo simulations.
@@ -124,6 +139,59 @@ class hullWhite:
             return __r_s
 
         return __wrapper
+
+
+class simpleREMIC:
+    """The simple REMIC class."""
+
+    def __init__(self, wac, warm, wala=0, psa=100, init_principle=100):
+        """Initiation of the object."""
+        # sanity check
+        assert type(warm) == int, \
+            "Input WAC should be an integer, not {}!".format(wac)
+
+        # dump in the variables
+        self.wac = wac
+        self.warm = warm
+        self.wala = wala
+        self.psa = psa
+        self.init_principle = init_principle
+        self.CPR = lambda i: self.psa/100*0.06*np.minimum(1, (i+self.wala)/30)
+        self.SMM = lambda i: 1 - np.power(1-self.CPR(i), 1/12.)
+
+    def setPSA(self, psa):
+        """Set PSA."""
+        self.psa = psa
+
+    def getCashFlows(self, fills=-1):
+        """
+        Get cashflows for each month.
+
+        Parameters:
+        fells = size of the output array of each cashflows,
+                default to the warm
+
+        return 3 cashflows: interests, principals, and prepayments
+        """
+        if (fills == -1):
+            fills = self.warm
+
+        _pmts = np.zeros(fills)
+        _ints = np.zeros(fills)
+        _prins = np.zeros(fills)
+        _prepays = np.zeros(fills)
+        _balance = self.init_principle
+        _c = self.wac/12
+
+        for i in range(self.warm):
+            _n = self.warm - i
+            _pmts[i] = _balance*_c*(1+_c)**_n/((1+_c)**_n-1)
+            _ints[i] = _c*_balance
+            _prins[i] = _pmts[i] - _ints[i]
+            _prepays[i] = (_balance - _prins[i])*self.SMM(i+1)
+            _balance -= _prepays[i] + _prins[i]
+
+        return _ints, _prins, _prepays
 
 
 def basisExpansion(data, power):
@@ -155,7 +223,8 @@ def capletVolToPrice(sig, T, dt, getZ, r_k, N=1):
     N   : notional, default to be 1
     """
     # get the forward rate
-    _f = (getZ(T-dt) / getZ(T) - 1) / dt
+    # _f = (getZ(T-dt) / getZ(T) - 1) / dt
+    _f = -np.log(getZ(T)/getZ(T-dt))/dt
 
     _d1 = np.log(_f / r_k)/sig/np.sqrt(T - dt) \
         + 0.5*sig*np.sqrt(T-dt)
@@ -186,8 +255,8 @@ def calCapletPrice(sig, T, dt, getZ, r_k, N=1):
     _d1 = np.log(getZ(T)/_K/getZ(T-dt))/sig + sig/2.
     _d2 = _d1 - sig
 
-    return _M*(_K*getZ(T-dt)*scipy.stats.norm.cdf(_d1) -
-               getZ(T)*scipy.stats.norm.cdf(_d2))
+    return _M*(_K*getZ(T-dt)*scipy.stats.norm.cdf(-_d2) -
+               getZ(T)*scipy.stats.norm.cdf(-_d1))
 
 
 def multiStepMC(z, price_evolution, anti=False,
@@ -244,14 +313,125 @@ def cashFlowMCSummary(CFs, Zs, Z_ups, Z_downs, shock):
     _path_results_up = np.apply_along_axis(np.dot, 1, Z_ups, CFs)
     _path_results_down = np.apply_along_axis(np.dot, 1, Z_downs, CFs)
 
-    _mean = _path_results.mean()
-    _se = scipy.stats.sem(_path_results)
+    _mean = _path_results.mean()  # mean
+    _se = scipy.stats.sem(_path_results)  # standard error
 
+    # duration
     _duration = (_path_results_up.mean()-_path_results_down.mean()) / \
         (_mean*2*shock)
 
+    # convexity
     _convexity = (_path_results_up.mean() +
                   _path_results_down.mean() - 2*_mean) / \
         (_mean*shock**2)
 
     return [_mean, _se, _duration, _convexity]
+
+
+def getOAS(CFs, Rs, dt, par):
+    """
+    Calculate the OAS.
+
+    Parameters:
+    CFs : undiscounted cash flow of a security
+    Rs  : an array of short rates, same dimension
+          as CFs
+    par : par value of the CFs
+    """
+    _diff = lambda _oas: abs(np.exp(-np.cumsum(Rs+_oas)*dt).dot(CFs)-par)
+    oas = scipy.optimize.fmin(_diff, 0, disp=False)
+    return oas[0]
+
+
+def getGroupTwoCFs(pool_cf, CA_init, CY_init, coupon):
+    """Very Tailored function to get the CFs of group 2."""
+    CA_b = np.maximum(CA_init - np.append(0, np.cumsum(pool_cf))[:-1],
+                      np.zeros(len(pool_cf)))
+    CA_p = np.minimum(CA_b, pool_cf)
+    CA_i = CA_b*coupon
+
+    CY_b = np.maximum(CY_init - np.append(0, np.cumsum(pool_cf - CA_p))[:-1],
+                      np.zeros(len(pool_cf)))
+    CY_p = np.minimum(pool_cf - CA_p, pool_cf)
+    CY_i = CY_b*coupon
+
+    return CA_p + CA_i, CY_p + CY_i  # return total cash flow of each asset
+
+
+def getGroupOneCFs(pool_cf, CG_init, VE_init, CM_init, GZ_init, TC_init,
+                   CZ_init, coupon, tranche_coupon):
+    """Very Tailored function to get the CFs of group 1."""
+    _n = len(pool_cf)
+    CG_b = np.zeros(_n)
+    VE_b = np.zeros(_n)
+    CM_b = np.zeros(_n)
+    GZ_b = np.zeros(_n)
+    TC_b = np.zeros(_n)
+    CZ_b = np.zeros(_n)
+    CG_i = np.zeros(_n)
+    VE_i = np.zeros(_n)
+    CM_i = np.zeros(_n)
+    GZ_i = np.zeros(_n)
+    TC_i = np.zeros(_n)
+    CZ_i = np.zeros(_n)
+    CG_p = np.zeros(_n)
+    VE_p = np.zeros(_n)
+    CM_p = np.zeros(_n)
+    GZ_p = np.zeros(_n)
+    TC_p = np.zeros(_n)
+    CZ_p = np.zeros(_n)
+    GZ_ti = np.zeros(_n)  # tranche coupon
+    CZ_ti = np.zeros(_n)  # tranche coupon
+    GZ_a = np.zeros(_n)
+    CZ_a = np.zeros(_n)
+
+    # set the initial balance:
+    CG_b[0] = CG_init
+    VE_b[0] = VE_init
+    CM_b[0] = CM_init
+    GZ_b[0] = GZ_init
+    TC_b[0] = TC_init
+    CZ_b[0] = CZ_init
+
+    for i in range(_n):
+        # interest in from tranche coupon rate
+        CZ_ti[i] = CZ_b[i]*tranche_coupon
+        GZ_ti[i] = GZ_b[i]*tranche_coupon
+
+        CG_p[i] = max(0, min(pool_cf[i] + CZ_ti[i], CG_b[i]))
+        VE_p[i] = max(0, min(pool_cf[i] + GZ_ti[i] + CZ_ti[i] -
+                             CG_p[i], VE_b[i]))
+        CM_p[i] = max(0, min(pool_cf[i] + GZ_ti[i] + CZ_ti[i] -
+                             CG_p[i] - VE_p[i], CM_b[i]))
+        _CM_b_next = CM_b[i] - CM_p[i]
+
+        GZ_a[i] = GZ_ti[i] if _CM_b_next > 0 else min(CM_p[i], GZ_ti[i])
+        GZ_p[i] = max(0, min(pool_cf[i] + GZ_a[i] + CZ_ti[i] -
+                             CG_p[i] - VE_p[i] - CM_p[i], GZ_b[i]))
+        _GZ_b_next = GZ_b[i] + GZ_a[i] - GZ_p[i]
+
+        TC_p[i] = 0 if _GZ_b_next > 0 \
+            else min(pool_cf[i] + CZ_ti[i] - GZ_p[i], TC_b[i])
+        _TC_b_next = TC_b[i] - TC_p[i]
+
+        CZ_a[i] = CZ_ti[i] if _TC_b_next > 0 else min(TC_p[i], CZ_ti[i])
+        CZ_p[i] = max(0, min(pool_cf[i] + CZ_a[i] - CG_p[i] - VE_p[i] -
+                             CM_p[i] - GZ_p[i] - TC_p[i], CZ_b[i]))
+
+        # interest batch
+        CG_i[i] = CG_b[i]*coupon
+        VE_i[i] = VE_b[i]*coupon
+        CM_i[i] = CM_b[i]*coupon
+        GZ_i[i] = GZ_ti[i] - GZ_a[i]
+        TC_i[i] = TC_b[i]*coupon
+        CZ_i[i] = CZ_ti[i] - CZ_a[i]
+
+        if(i < _n-1):  # we don't update the last period's balance
+            CG_b[i+1] = CG_b[i] - CG_p[i]
+            VE_b[i+1] = VE_b[i] - VE_p[i]
+            CM_b[i+1] = _CM_b_next
+            GZ_b[i+1] = _GZ_b_next
+            TC_b[i+1] = _TC_b_next
+            CZ_b[i+1] = CZ_b[i] + CZ_a[i] - CZ_p[i]
+
+    return CG_p+CG_i, VE_p+VE_i, CM_p+CM_i, GZ_p+GZ_i, TC_p+TC_i, CZ_p+CZ_i
