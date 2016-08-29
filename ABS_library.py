@@ -4,7 +4,9 @@ Welcome to the ABS_library.
 This library contains all generic functions
 required for the MFE230M HWs.
 
-7/17/2016 -- Initiation of the library
+8/27/2016 -- Finalized for the HW1 part.
+
+8/17/2016 -- Initiation of the library.
 """
 
 import numpy as np
