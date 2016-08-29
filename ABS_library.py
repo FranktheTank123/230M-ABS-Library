@@ -319,7 +319,7 @@ def cashFlowMCSummary(CFs, Zs, Z_ups, Z_downs, shock):
     _se = scipy.stats.sem(_path_results)  # standard error
 
     # duration
-    _duration = (_path_results_up.mean()-_path_results_down.mean()) / \
+    _duration = -(_path_results_up.mean()-_path_results_down.mean()) / \
         (_mean*2*shock)
 
     # convexity
