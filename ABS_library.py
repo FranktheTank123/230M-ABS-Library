@@ -81,7 +81,7 @@ class hullWhite:
 
     def getA(self, t, T):
         """Get A."""
-        if(type(T) != float):
+        if(type(T) != float and type(T) != int):
             _term1 = np.array([-scipy.integrate.quad(
                 lambda tau: self.getB(tau, _T) * self.getTheta(tau), t, _T)[0]
                 for _T in T])
@@ -142,6 +142,15 @@ class hullWhite:
 
         return __wrapper
 
+    def getSpotRate(self, t=0):
+        """Return a function of LIBOR spot rate"""
+        def __wrapper(_tau):
+            __part1 = -self.getA(t, t+_tau)/_tau
+            __part2 = (1-np.exp(-self.kappa*_tau))/_tau /\
+                self.kappa*self.short_rate
+            return __part1 + __part2
+        return __wrapper
+
 
 class simpleREMIC:
     """The simple REMIC class."""
@@ -164,6 +173,14 @@ class simpleREMIC:
     def setPSA(self, psa):
         """Set PSA."""
         self.psa = psa
+
+    def setCPR(self, CPR):
+        """Set CPR."""
+        self.CPR = CPR
+
+    def setSMM(self, SMM):
+        """Set SMM."""
+        self.SMM = SMM
 
     def getCashFlows(self, fills=-1):
         """
@@ -437,3 +454,17 @@ def getGroupOneCFs(pool_cf, CG_init, VE_init, CM_init, GZ_init, TC_init,
             CZ_b[i+1] = CZ_b[i] + CZ_a[i] - CZ_p[i]
 
     return CG_p+CG_i, VE_p+VE_i, CM_p+CM_i, GZ_p+GZ_i, TC_p+TC_i, CZ_p+CZ_i
+
+
+""""
+Below are the new functions for HW2.
+"""
+
+
+def hazardRateFactory(gamma, p, b1, b2, v1, v2):
+    """Return a tailored Hazard rate function."""
+    def __wrapper(_t):
+        __part1 = gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p))
+        __part2 = np.exp(b1*v1(_t) + b2*v2(_t))
+        return __part1 * __part2
+    return __wrapper
