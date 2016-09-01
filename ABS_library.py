@@ -81,13 +81,13 @@ class hullWhite:
 
     def getA(self, t, T):
         """Get A."""
-        if(type(T) != float and type(T) != int):
+        try:
+            _term1 = -scipy.integrate.quad(
+                lambda tau: self.getB(tau, T) * self.getTheta(tau), t, T)[0]
+        except:  # array case
             _term1 = np.array([-scipy.integrate.quad(
                 lambda tau: self.getB(tau, _T) * self.getTheta(tau), t, _T)[0]
                 for _T in T])
-        else:
-            _term1 = -scipy.integrate.quad(
-                lambda tau: self.getB(tau, T) * self.getTheta(tau), t, T)[0]
 
         _term2 = self.sig**2/2/self.kappa**2 * \
             (T-t+(1-np.exp(-2*self.kappa*(T-t)))/2/self.kappa -
@@ -465,6 +465,9 @@ def hazardRateFactory(gamma, p, b1, b2, v1, v2):
     """Return a tailored Hazard rate function."""
     def __wrapper(_t):
         __part1 = gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p))
-        __part2 = np.exp(b1*v1(_t) + b2*v2(_t))
+        try:  # when _t is array
+            __part2 = np.array([np.exp(b1*v1(__t) + b2*v2(__t)) for __t in _t])
+        except:
+            __part2 = np.exp(b1*v1(_t) + b2*v2(_t))
         return __part1 * __part2
     return __wrapper
