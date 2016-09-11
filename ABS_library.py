@@ -85,9 +85,14 @@ class hullWhite:
             _term1 = -scipy.integrate.quad(
                 lambda tau: self.getB(tau, T) * self.getTheta(tau), t, T)[0]
         except:  # array case
-            _term1 = np.array([-scipy.integrate.quad(
-                lambda tau: self.getB(tau, _T) * self.getTheta(tau), t, _T)[0]
-                for _T in T])
+            try:
+                _term1 = np.array([-scipy.integrate.quad(
+                    lambda tau: self.getB(tau, _T) * self.getTheta(tau), t, _T)[0]
+                    for _T in T])
+            except: # both t and T are arrays
+                _term1 = np.array([-scipy.integrate.quad(
+                    lambda tau: self.getB(tau, _T) * self.getTheta(tau), _t, _T)[0]
+                    for (_t, _T) in zip(t, T)])
 
         _term2 = self.sig**2/2/self.kappa**2 * \
             (T-t+(1-np.exp(-2*self.kappa*(T-t)))/2/self.kappa -
@@ -150,12 +155,21 @@ class hullWhite:
                 self.kappa*self.short_rate
             return __part1 + __part2
         return __wrapper
+        
+    def getFutureRate(self, t, r_t):
+        """Return a function of future LIBOR rate, given short rates"""
+        def __wrapper(_tau):
+            __part1 = -self.getA(t, t+_tau)/_tau
+            __part2 = (1-np.exp(-self.kappa*_tau))/_tau /\
+                self.kappa*r_t
+            return __part1 + __part2
+        return __wrapper
 
 
 class simpleREMIC:
     """The simple REMIC class."""
 
-    def __init__(self, wac, warm, wala=0, psa=100, init_principle=100):
+    def __init__(self, wac, warm, wala=0, psa=100, init_principle=100, Npath=1):
         """Initiation of the object."""
         # sanity check
         assert type(warm) == int, \
@@ -166,9 +180,10 @@ class simpleREMIC:
         self.warm = warm
         self.wala = wala
         self.psa = psa
-        self.init_principle = init_principle
+        self.init_principle = float(init_principle)
         self.CPR = lambda i: self.psa/100*0.06*np.minimum(1, (i+self.wala)/30)
         self.SMM = lambda i: 1 - np.power(1-self.CPR(i), 1/12.)
+        self.Npath = Npath
 
     def setPSA(self, psa):
         """Set PSA."""
@@ -187,7 +202,7 @@ class simpleREMIC:
         Get cashflows for each month.
 
         Parameters:
-        fells = size of the output array of each cashflows,
+        fills = size of the output array of each cashflows,
                 default to the warm
 
         return 3 cashflows: interests, principals, and prepayments
@@ -195,20 +210,21 @@ class simpleREMIC:
         if (fills == -1):
             fills = self.warm
 
-        _pmts = np.zeros(fills)
-        _ints = np.zeros(fills)
-        _prins = np.zeros(fills)
-        _prepays = np.zeros(fills)
-        _balance = self.init_principle
+        Npath = self.Npath
+        _pmts = np.squeeze(np.zeros((Npath, fills)))
+        _ints = np.squeeze(np.zeros((Npath, fills)))
+        _prins = np.squeeze(np.zeros((Npath, fills)))
+        _prepays = np.squeeze(np.zeros((Npath, fills)))
+        _balance = np.repeat(self.init_principle, Npath)
         _c = self.wac/12
 
-        for i in range(self.warm):
+        for i in range(min(self.warm, fills)):
             _n = self.warm - i
-            _pmts[i] = _balance*_c*(1+_c)**_n/((1+_c)**_n-1)
-            _ints[i] = _c*_balance
-            _prins[i] = _pmts[i] - _ints[i]
-            _prepays[i] = (_balance - _prins[i])*self.SMM(i+1)
-            _balance -= _prepays[i] + _prins[i]
+            _pmts[:, i] = _balance*_c*(1+_c)**_n/((1+_c)**_n-1)
+            _ints[:, i] = _c*_balance
+            _prins[:, i] = _pmts[:, i] - _ints[:, i]
+            _prepays[:, i] = (_balance - _prins[:, i])*self.SMM(i+1)
+            _balance -= _prepays[:, i] + _prins[:, i]
 
         return _ints, _prins, _prepays
 
@@ -364,13 +380,14 @@ def getOAS(CFs, Rs, dt, par):
 
 def getGroupTwoCFs(pool_cf, CA_init, CY_init, coupon):
     """Very Tailored function to get the CFs of group 2."""
-    CA_b = np.maximum(CA_init - np.append(0, np.cumsum(pool_cf))[:-1],
-                      np.zeros(len(pool_cf)))
+    _x, _y = pool_cf.shape
+    CA_b = np.maximum(0, CA_init - np.append(np.zeros((_x, 1)),
+                                             np.cumsum(pool_cf, axis=1), axis=1)[:,:-1])
     CA_p = np.minimum(CA_b, pool_cf)
     CA_i = CA_b*coupon
 
-    CY_b = np.maximum(CY_init - np.append(0, np.cumsum(pool_cf - CA_p))[:-1],
-                      np.zeros(len(pool_cf)))
+    CY_b = np.maximum(0, CY_init - np.append(np.zeros((_x, 1)),
+                                             np.cumsum(pool_cf - CA_p, axis=1), axis=1)[:,:-1])
     CY_p = np.minimum(pool_cf - CA_p, pool_cf)
     CY_i = CY_b*coupon
 
@@ -380,78 +397,85 @@ def getGroupTwoCFs(pool_cf, CA_init, CY_init, coupon):
 def getGroupOneCFs(pool_cf, CG_init, VE_init, CM_init, GZ_init, TC_init,
                    CZ_init, coupon, tranche_coupon):
     """Very Tailored function to get the CFs of group 1."""
-    _n = len(pool_cf)
-    CG_b = np.zeros(_n)
-    VE_b = np.zeros(_n)
-    CM_b = np.zeros(_n)
-    GZ_b = np.zeros(_n)
-    TC_b = np.zeros(_n)
-    CZ_b = np.zeros(_n)
-    CG_i = np.zeros(_n)
-    VE_i = np.zeros(_n)
-    CM_i = np.zeros(_n)
-    GZ_i = np.zeros(_n)
-    TC_i = np.zeros(_n)
-    CZ_i = np.zeros(_n)
-    CG_p = np.zeros(_n)
-    VE_p = np.zeros(_n)
-    CM_p = np.zeros(_n)
-    GZ_p = np.zeros(_n)
-    TC_p = np.zeros(_n)
-    CZ_p = np.zeros(_n)
-    GZ_ti = np.zeros(_n)  # tranche coupon
-    CZ_ti = np.zeros(_n)  # tranche coupon
-    GZ_a = np.zeros(_n)
-    CZ_a = np.zeros(_n)
+    _Npath, _n = pool_cf.shape
+    CG_b = np.zeros((_Npath, _n))
+    VE_b = np.zeros((_Npath, _n))
+    CM_b = np.zeros((_Npath, _n))
+    GZ_b = np.zeros((_Npath, _n))
+    TC_b = np.zeros((_Npath, _n))
+    CZ_b = np.zeros((_Npath, _n))
+    CG_i = np.zeros((_Npath, _n))
+    VE_i = np.zeros((_Npath, _n))
+    CM_i = np.zeros((_Npath, _n))
+    GZ_i = np.zeros((_Npath, _n))
+    TC_i = np.zeros((_Npath, _n))
+    CZ_i = np.zeros((_Npath, _n))
+    CG_p = np.zeros((_Npath, _n))
+    VE_p = np.zeros((_Npath, _n))
+    CM_p = np.zeros((_Npath, _n))
+    GZ_p = np.zeros((_Npath, _n))
+    TC_p = np.zeros((_Npath, _n))
+    CZ_p = np.zeros((_Npath, _n))
+    GZ_ti = np.zeros((_Npath, _n))  # tranche coupon
+    CZ_ti = np.zeros((_Npath, _n))  # tranche coupon
+    GZ_a = np.zeros((_Npath, _n))
+    CZ_a = np.zeros((_Npath, _n))
 
     # set the initial balance:
-    CG_b[0] = CG_init
-    VE_b[0] = VE_init
-    CM_b[0] = CM_init
-    GZ_b[0] = GZ_init
-    TC_b[0] = TC_init
-    CZ_b[0] = CZ_init
+    CG_b[:,0] = CG_init
+    VE_b[:,0] = VE_init
+    CM_b[:,0] = CM_init
+    GZ_b[:,0] = GZ_init
+    TC_b[:,0] = TC_init
+    CZ_b[:,0] = CZ_init
 
     for i in range(_n):
         # interest in from tranche coupon rate
-        CZ_ti[i] = CZ_b[i]*tranche_coupon
-        GZ_ti[i] = GZ_b[i]*tranche_coupon
+        CZ_ti[:, i] = CZ_b[:, i] * tranche_coupon
+        GZ_ti[:, i] = GZ_b[:, i] * tranche_coupon
 
-        CG_p[i] = max(0, min(pool_cf[i] + CZ_ti[i], CG_b[i]))
-        VE_p[i] = max(0, min(pool_cf[i] + GZ_ti[i] + CZ_ti[i] -
-                             CG_p[i], VE_b[i]))
-        CM_p[i] = max(0, min(pool_cf[i] + GZ_ti[i] + CZ_ti[i] -
-                             CG_p[i] - VE_p[i], CM_b[i]))
-        _CM_b_next = CM_b[i] - CM_p[i]
+        CG_p[:, i] = np.maximum(0, np.minimum(pool_cf[:,i] + CZ_ti[:,i], CG_b[:,i]))
+        VE_p[:, i] = np.maximum(0, np.minimum(pool_cf[:,i] + GZ_ti[:,i] + CZ_ti[:,i] - CG_p[:,i],
+                                              VE_b[:,i]))
+        CM_p[:,i] = np.maximum(0, np.minimum(pool_cf[:,i] + GZ_ti[:,i] + CZ_ti[:,i] - CG_p[:,i] - VE_p[:,i],
+                                             CM_b[:,i]))
 
-        GZ_a[i] = GZ_ti[i] if _CM_b_next > 0 else min(CM_p[i], GZ_ti[i])
-        GZ_p[i] = max(0, min(pool_cf[i] + GZ_a[i] + CZ_ti[i] -
-                             CG_p[i] - VE_p[i] - CM_p[i], GZ_b[i]))
-        _GZ_b_next = GZ_b[i] + GZ_a[i] - GZ_p[i]
+        # Binary choice
+        _CM_b_next = CM_b[:,i] - CM_p[:,i]
+        _b_CM_b_next = (_CM_b_next > 0).astype(float)
+        GZ_a[:,i] =  _b_CM_b_next * GZ_ti[:,i] + (1-_b_CM_b_next) * np.minimum(CM_p[:,i], GZ_ti[:,i])
 
-        TC_p[i] = 0 if _GZ_b_next > 0 \
-            else min(pool_cf[i] + CZ_ti[i] - GZ_p[i], TC_b[i])
-        _TC_b_next = TC_b[i] - TC_p[i]
+        GZ_p[:,i] = np.maximum(0, np.minimum(pool_cf[:,i] + GZ_a[:,i] + CZ_ti[:,i] - CG_p[:,i] - VE_p[:,i] - CM_p[:,i],
+                                             GZ_b[:,i]))
+        # Binary choice
+        _GZ_b_next = GZ_b[:,i] + GZ_a[:,i] - GZ_p[:,i]
+        _b_GZ_b_next = (_GZ_b_next > 0).astype(float)
+        TC_p[:,i] = (1-_b_GZ_b_next) * \
+                    np.minimum(pool_cf[:,i] + CZ_ti[:,i] - GZ_p[:,i], TC_b[:,i])
 
-        CZ_a[i] = CZ_ti[i] if _TC_b_next > 0 else min(TC_p[i], CZ_ti[i])
-        CZ_p[i] = max(0, min(pool_cf[i] + CZ_a[i] - CG_p[i] - VE_p[i] -
-                             CM_p[i] - GZ_p[i] - TC_p[i], CZ_b[i]))
+        # Binary choice
+        _TC_b_next = TC_b[:,i] - TC_p[:,i]
+        _b_TC_b_next = (_TC_b_next > 0).astype(float)
+        CZ_a[:,i] = _b_TC_b_next * CZ_ti[:,i] + (1-_b_TC_b_next) * np.minimum(TC_p[:,i], CZ_ti[:,i])
+
+        CZ_p[:,i] = np.maximum(0, np.minimum(pool_cf[:,i] + CZ_a[:,i] - CG_p[:,i] - VE_p[:,i] - CM_p[:,i] - GZ_p[:,i] - TC_p[:,i],
+                                             CZ_b[:,i]))
 
         # interest batch
-        CG_i[i] = CG_b[i]*coupon
-        VE_i[i] = VE_b[i]*coupon
-        CM_i[i] = CM_b[i]*coupon
-        GZ_i[i] = GZ_ti[i] - GZ_a[i]
-        TC_i[i] = TC_b[i]*coupon
-        CZ_i[i] = CZ_ti[i] - CZ_a[i]
+        CG_i[:,i] = CG_b[:,i]*coupon
+        VE_i[:,i] = VE_b[:,i]*coupon
+        CM_i[:,i] = CM_b[:,i]*coupon
+        GZ_i[:,i] = GZ_ti[:,i] - GZ_a[:,i]
+        TC_i[:,i] = TC_b[:,i]*coupon
+        CZ_i[:,i] = CZ_ti[:,i] - CZ_a[:,i]
 
         if(i < _n-1):  # we don't update the last period's balance
-            CG_b[i+1] = CG_b[i] - CG_p[i]
-            VE_b[i+1] = VE_b[i] - VE_p[i]
-            CM_b[i+1] = _CM_b_next
-            GZ_b[i+1] = _GZ_b_next
-            TC_b[i+1] = _TC_b_next
-            CZ_b[i+1] = CZ_b[i] + CZ_a[i] - CZ_p[i]
+            CG_b[:,i+1] = CG_b[:,i] - CG_p[:,i]
+            VE_b[:,i+1] = VE_b[:,i] - VE_p[:,i]
+            CM_b[:,i+1] = _CM_b_next
+            GZ_b[:,i+1] = _GZ_b_next
+            TC_b[:,i+1] = _TC_b_next
+            CZ_b[:,i+1] = CZ_b[:,i] + CZ_a[:,i] - CZ_p[:,i]
 
     return CG_p+CG_i, VE_p+VE_i, CM_p+CM_i, GZ_p+GZ_i, TC_p+TC_i, CZ_p+CZ_i
 
@@ -463,11 +487,48 @@ Below are the new functions for HW2.
 
 def hazardRateFactory(gamma, p, b1, b2, v1, v2):
     """Return a tailored Hazard rate function."""
-    def __wrapper(_t):
-        __part1 = gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p))
+    def __wrapper(_t):      
         try:  # when _t is array
-            __part2 = np.array([np.exp(b1*v1(__t) + b2*v2(__t)) for __t in _t])
+            __part2 = np.array([np.exp(b1*v1(__t) + b2*v2(__t))  for __t in _t])
+            __part1 = np.repeat(gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p)),
+                                __part2.shape[1]).reshape((len(_t), -1))
+            return (__part1 * __part2).T
         except:
             __part2 = np.exp(b1*v1(_t) + b2*v2(_t))
-        return __part1 * __part2
+            __part1 = gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p))
+            return __part1 * __part2
     return __wrapper
+
+def hazardToSMM(hazard_func):
+    """Convert from hazard rate to SMM"""
+    def __wrapper(_t):
+        try: # when _t is array
+            _x = [np.linspace(__t, __t+1, num=100, endpoint=False) for __t in _t]
+            return (1.0 - np.array([np.exp(-np.trapz(hazard_func(__x), __x)) for __x in _x])).T
+        except:
+            _x = np.linspace(_t, _t+1, num=100, endpoint=False)
+            return 1.0 - np.exp(-np.trapz(hazard_func(_x), _x))
+    return __wrapper
+
+def cashFlowPriceMC(CFs, Zs, anti=False):
+    """
+    A very tailored function for HW2.
+
+    Parameters:
+    CFs : a m by n array of MC simulated undiscounted cash flow of a security
+    Zs  : a m by n array of MC simulated discount factors
+
+    Will return average price of all m paths
+    """
+    # pathwise results (one path in each row)
+    _path_results = (CFs * Zs).sum(axis=1)
+
+    if anti:
+        # Average of anti-thetic paths (2nd half is the mirror paths)
+        _n = int(len(_path_results) / 2)
+        _path_results = (_path_results[:_n] + _path_results[_n:]) / 2
+    
+    _mean = _path_results.mean()  # mean
+    _se = scipy.stats.sem(_path_results)  # standard error
+
+    return _mean, _se
