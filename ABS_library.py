@@ -4,6 +4,8 @@ Welcome to the ABS_library.
 This library contains all generic functions
 required for the MFE230M HWs.
 
+9/12/2016 -- add HW3 part
+
 8/27/2016 -- Finalized for the HW1 part.
 
 8/17/2016 -- Initiation of the library.
@@ -480,10 +482,10 @@ def getGroupOneCFs(pool_cf, CG_init, VE_init, CM_init, GZ_init, TC_init,
     return CG_p+CG_i, VE_p+VE_i, CM_p+CM_i, GZ_p+GZ_i, TC_p+TC_i, CZ_p+CZ_i
 
 
+
 """"
 Below are the new functions for HW2.
 """
-
 
 def hazardRateFactory(gamma, p, b1, b2, v1, v2):
     """Return a tailored Hazard rate function."""
@@ -499,6 +501,7 @@ def hazardRateFactory(gamma, p, b1, b2, v1, v2):
             return __part1 * __part2
     return __wrapper
 
+
 def hazardToSMM(hazard_func):
     """Convert from hazard rate to SMM"""
     def __wrapper(_t):
@@ -509,6 +512,7 @@ def hazardToSMM(hazard_func):
             _x = np.linspace(_t, _t+1, num=100, endpoint=False)
             return 1.0 - np.exp(-np.trapz(hazard_func(_x), _x))
     return __wrapper
+
 
 def cashFlowPriceMC(CFs, Zs, anti=False):
     """
@@ -532,3 +536,250 @@ def cashFlowPriceMC(CFs, Zs, anti=False):
     _se = scipy.stats.sem(_path_results)  # standard error
 
     return _mean, _se
+
+
+""""
+Below are the new functions for HW3.
+"""
+
+class simpleCMBS:
+    """The simple CMBS pool class."""
+
+    def __init__(self, wac, warm, wala=0, psa=100, init_principle=100, Npath=1):
+        """Initiation of the object."""
+        # sanity check
+        assert type(warm) == int, \
+            "Input WAC should be an integer, not {}!".format(wac)
+
+        # dump in the variables
+        self.wac = wac  ## this should be a function!
+        self.warm = warm
+        self.wala = wala
+        self.psa = psa
+        self.init_principle = float(init_principle)
+        self.CPR = lambda i: self.psa/100*0.06*np.minimum(1, (i+self.wala)/30)
+        self.SMM = lambda i: 1 - np.power(1-self.CPR(i), 1/12.)
+        self.DEF = lambda i: 1 - np.power(0)
+        self.Npath = Npath
+        self.principals = np.repeat(init_principle, Npath*warm).reshape(Npath, warm)
+
+    def setPSA(self, psa):
+        """Set PSA."""
+        self.psa = psa
+
+    def setCPR(self, CPR):
+        """Set CPR."""
+        self.CPR = CPR
+
+    def setSMM(self, SMM):
+        """Set SMM."""
+        self.SMM = SMM
+
+    def setDef(self, DEF):
+        """Set default rate evolution"""
+        self.DEF = DEF
+    def getPrinciple(self, t):
+        return self.principals[:,t]
+
+    def getCashFlows(self, fills=-1):
+        """
+        Get cashflows for each month.
+
+        Parameters:
+        fills = size of the output array of each cashflows,
+                default to the warm
+
+        return 3 cashflows: interests, principals, and prepayments
+        """
+        if (fills == -1):
+            fills = self.warm
+
+        Npath = self.Npath
+        _pmts = np.squeeze(np.zeros((Npath, fills)))
+        _ints = np.squeeze(np.zeros((Npath, fills)))
+        _prins = np.squeeze(np.zeros((Npath, fills)))
+        _prepays = np.squeeze(np.zeros((Npath, fills)))
+        _defaults = np.squeeze(np.zeros((Npath, fills)))
+        #_balance = np.repeat(self.init_principle, Npath)
+        _balance = self.getPrinciple(0)
+
+        for i in range(min(self.warm, fills)):
+
+            _c = self.wac(i)/12 ## this is time_varying
+            _n = self.warm - i
+            ## determin the defaults at t
+            _defaults[:, i] = _balance*self.DEF(i+1) # each row might be different
+            _pmts[:, i] = (_balance-_defaults[:, i])*_c*(1+_c)**_n/((1+_c)**_n-1)
+
+            _ints[:, i] = _c*(_balance-_defaults[:, i])
+            _prins[:, i] = _pmts[:, i] - _ints[:, i]
+            _prepays[:, i] = (_balance-_defaults[:, i] - _prins[:, i])*self.SMM(i+1)
+            _balance -= (_prepays[:, i] + _prins[:, i] + _defaults[:, i])
+
+            ## update principals
+            if i < min(self.warm, fills)-1:
+                self.principals[:,i+1] = _balance
+
+        return _ints, _prins, _prepays, _defaults
+
+
+def getHousePrice(q, phi, dt, h_0=1.):
+    """
+    Return a function for Monte Carlo simulations for House Price.
+
+    parameters --
+    q: rental flow rate
+    phi: volatility
+    h_0: current house price
+    """
+    def __wrapper(rz):  # rz is a 1d array of lenth 2n, where the first n is r,
+                        # and the last n is z
+        _n = int(len(rz)/2)
+        _r = rz[:_n]
+        _z = rz[_n:]
+        
+        __h_s = np.repeat(h_0, len(_z)+1)  # r_t space
+        for _i, (_r_i, _z_i) in enumerate(zip(_r, _z)):
+            __temp = 1 + (_r_i - q) * dt + phi*np.sqrt(dt)*_z_i
+            
+            __h_s[_i+1] = __h_s[_i] * __temp
+
+        return __h_s
+
+    return __wrapper
+
+
+
+def getCMBScashFlow(pool_pp, pool_int, pool_def, 
+    init_princ_array, spreads, LIBOR, dt=1/12):
+    """
+    Get the CF of a CMBS.
+
+    Parameter:
+    pool_pp:  pool prepayment+principle, going all from top
+    pool_int: pool interests
+    pool_def: pool default
+    init_princ_array: array of asset initial value
+    spreads: assets' spread to libor in decimal, should be the same size
+             with init_princ_array
+    LIBOR:  market libor rate, same dimension as pool_*
+    """
+    _Npath, _n = pool_pp.shape
+    # print(_Npath)
+    _n_asset = len(init_princ_array)
+
+    # 3d_array:  path x n_of_asset x payment length
+    assets_cf = np.zeros((_Npath, _n_asset, _n)) 
+    # this is path x n_of_asset
+    _curr_princ = np.repeat([init_princ_array],_Npath,axis=0)
+
+    prin_id_now = np.repeat(0, _Npath) # current asset under pp
+    def_id_now = np.repeat(_n_asset-1, _Npath) # current asset under default payment
+
+    ## below is just magic... don't touch! 
+    for i in range(_n): # iterate through asset length
+        # print(i, "pp")
+        ## first we deal with pp...
+        curr_pp = pool_pp[:,i]  # pp at time i
+
+        while(any(curr_pp>0)):  
+
+            ## get current index of top asset with principle > 0
+            # print(prin_id_now, curr_pp.sum())
+            top_princ_temp = _curr_princ[np.arange(_Npath), prin_id_now]
+
+            ## update the current principle
+            _curr_princ[np.arange(_Npath), prin_id_now] -= \
+                np.minimum(top_princ_temp, curr_pp)
+
+            ## check whether this principle will survive
+            _principle_survive = (top_princ_temp - curr_pp) > 0
+
+            ## update the asset cash flow 
+            assets_cf[np.arange(_Npath), prin_id_now, np.repeat(i,_Npath)] += \
+                np.minimum(curr_pp, top_princ_temp)
+
+            ## get unpaid pp at current asset class
+            curr_pp = np.maximum(0, curr_pp - top_princ_temp)
+
+            ## update the current asset under pp
+            prin_id_now += 1 - _principle_survive * 1 
+
+            ## if prin_id_now for an asset is out of bound, but pp is still >0
+            ## for that path, we terminate that path manuall by set that path's
+            ## pp to 0
+            curr_pp[prin_id_now >= _n_asset] = 0
+            prin_id_now[prin_id_now >= _n_asset] = _n_asset-1 ## avoid of OOB
+
+        # print(i, "def")
+        ## next we deal with default...
+        curr_def = pool_def[:,i] ## defaut payment at time i
+
+        while(any(curr_def>0)):
+            # print(def_id_now)
+            ## get current index of bottom asset with principle > 0
+            bottom_princ_temp = _curr_princ[np.arange(_Npath), def_id_now]
+
+            ## update the current principle
+            _curr_princ[np.arange(_Npath), def_id_now] -= \
+                np.minimum(bottom_princ_temp, curr_def)
+
+            
+            ## check whether this principle will survive
+            _principle_survive = (bottom_princ_temp - curr_def) > 0
+
+            ## get unpaid def at current asset class
+            curr_def = np.maximum(0, curr_def - top_princ_temp)
+
+            ## update the current asset under pp
+            def_id_now -= 1 - _principle_survive * 1 
+
+            ## if def_id_now for an asset is out of bound (0), but pp is still >0
+            ## for that path, we terminate that path manuall by set that path's
+            ## pp to 0
+            curr_def[def_id_now < 0] = 0
+            def_id_now[def_id_now < 0 ] = 0 ## avoid of OOB
+
+
+        ## next we deal with interests
+        curr_int = pool_int[:,i] ## interests payment at time i
+
+        # get interest rate for each asset and path
+        _int_rate = np.add.outer(LIBOR[:,i], spreads)
+
+        # the theoretical interest payment 
+        _face_int_accu = _curr_princ * _int_rate
+
+        # set up target 
+        _target = curr_int.reshape(_Npath,1)
+
+        # track the results
+        _real_int_payment = _face_int_accu.copy()
+        _real_int_payment[np.greater_equal(np.cumsum(_face_int_accu,axis=1), _target)] = 0
+
+        last_non_zero = np.less(np.cumsum(_face_int_accu,axis=1), _target).sum(axis=1)
+        last_non_zero = np.minimum(last_non_zero, 5)
+
+        _real_int_payment[np.arange(len(_face_int_accu)), last_non_zero] = \
+            np.minimum(_face_int_accu[np.arange(len(_face_int_accu)), last_non_zero], 
+                np.squeeze(_target) - _real_int_payment.sum(axis=1))
+        
+        assets_cf[:,:,i] += _real_int_payment
+
+
+    return assets_cf
+
+
+def hazardRateFactory_3(gamma, p, b1, b2, b3, v1, v2, v3):
+    """Return a tailored Hazard rate function, 3 factors."""
+    def __wrapper(_t):      
+        try:  # when _t is array
+            __part2 = np.array([np.exp(b1*v1(__t) + b2*v2(__t) + b3*v3(__t))  for __t in _t])
+            __part1 = np.repeat(gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p)),
+                                __part2.shape[1]).reshape((len(_t), -1))
+            return (__part1 * __part2).T
+        except:
+            __part2 = np.exp(b1*v1(_t) + b2*v2(_t) + b3*v3(__t))
+            __part1 = gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p))
+            return __part1 * __part2
+    return __wrapper
