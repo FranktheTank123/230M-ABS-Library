@@ -502,6 +502,30 @@ def hazardRateFactory(gamma, p, b1, b2, v1, v2):
     return __wrapper
 
 
+def hazardRateFactory_gen(gamma, p, bs, vs):
+    """
+    Meet arbitrary length of b and v
+
+    Here we assume bs and vs are all vectorized:
+
+    bs: 1 x m where m is the size of the covariates
+    vs: a function that take t, and return m x n size of the variates
+    """
+    def __wrapper(_t):      
+        try:  # when _t is array
+            __part2 = np.array([np.exp(bs.dot(vs(__t)))  for __t in _t])
+            __part1 = np.repeat(gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p)),
+                                __part2.shape[1]).reshape((len(_t), -1))
+            return (__part1 * __part2).T
+        except:
+            __part2 = np.exp(bs.dot(vs(_t)))
+            __part1 = gamma*p*np.power(gamma*_t, p-1)/(1+np.power(gamma*_t, p))
+            return __part1 * __part2
+    return __wrapper
+
+
+
+
 def hazardToSMM(hazard_func):
     """Convert from hazard rate to SMM"""
     def __wrapper(_t):
