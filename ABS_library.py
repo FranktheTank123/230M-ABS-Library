@@ -127,7 +127,7 @@ class hullWhite:
         return lambda T: np.exp(self.getA(t, T) -
                                 self.getB(t, T) * self.short_rate)
 
-    def getMC(self, r_t, T, t=0):
+    def getMC(self, T, t=0):
         """
         Return a function for Monte Carlo simulations.
 
@@ -139,7 +139,7 @@ class hullWhite:
         def __wrapper(_z):  # _z should be 1d array of normal random variable
             __dt = (T-t)/len(_z)
             __time_stpes = np.linspace(t, T, len(_z)+1)  # time space
-            __r_s = np.repeat(r_t, len(_z)+1)  # r_t space
+            __r_s = np.repeat(self.short_rate, len(_z)+1)  # r_t space
 
             for _i, _z_i in enumerate(_z):
                 __r_s[_i+1] = __r_s[_i]+(self.getTheta(__time_stpes[_i+1]) -
@@ -858,7 +858,83 @@ def hazardRateFactory_1(gamma, p, b, v):
     return __wrapper
 
 
-def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
+""""
+Below are the new functions for project.
+"""
+
+class simpleCMBS:
+    """The simple CMBS pool class."""
+
+    def __init__(self, wac, warm, waap, init_principle, Npath=1):
+        """Initiation of the object."""
+        # sanity check
+        assert type(warm) == int, \
+            "Input WARM should be an integer, not {}!".format(wac)
+
+        # dump in the variables
+        self.wac = wac  ## this should be a function!
+        self.warm = warm ## Weighted Average Remaining time to Maturity 
+        self.waap = waap ## Weighted Average Amortization Period
+        self.init_principle = float(init_principle)
+        self.DEF = lambda i: 1 - np.power(0)
+        self.Npath = Npath
+        self.principals = np.repeat(init_principle, Npath*warm).reshape(Npath, warm)
+
+    def setDef(self, DEF):
+        """Set Def."""
+        self.DEF = DEF 
+
+    def getDef(self):
+        """Get Def."""
+        return self.DEF
+        
+    def getPrinciple(self, t):
+        return self.principals[:, t]
+
+    def getCashFlows(self, fills=-1):
+        """
+        Get cashflows for each month.
+
+        Parameters:
+        fills = size of the output array of each cashflows,
+                default to the warm
+
+        return 3 cashflows: interests, principals, and prepayments
+        """
+        if (fills == -1):
+            fills = self.warm
+
+        Npath = self.Npath
+        _pmts = np.squeeze(np.zeros((Npath, fills)))
+        _ints = np.squeeze(np.zeros((Npath, fills)))
+        _prins = np.squeeze(np.zeros((Npath, fills)))
+        _defaults = np.squeeze(np.zeros((Npath, fills)))
+        #_balance = np.repeat(self.init_principle, Npath)
+        _balance = self.getPrinciple(0)
+
+        for i in range(min(self.warm, fills)):
+
+            _c = self.wac(i) / 12 ## this is time_varying
+            _n = self.waap - i
+            ## determin the defaults at t            
+            _defaults[:, i] = _balance*self.DEF(i+1) # each row might be different
+            _pmts[:, i] = (_balance-_defaults[:, i])*_c*(1+_c)**_n/((1+_c)**_n-1)
+
+            _ints[:, i] = _c*(_balance-_defaults[:, i])
+            _prins[:, i] = _pmts[:, i] - _ints[:, i]
+            _balance -= (_prins[:, i] + _defaults[:, i])
+
+            ## update principals
+            if i < min(self.warm, fills)-1:
+                self.principals[:,i+1] = _balance
+            else: ## last period, balloon payments of all remaining balance
+                _prins[:, i] += _balance
+                _balance = 0
+                
+        return _ints, _prins, _defaults
+
+
+def getCMBScashFlow(ADA_init, loss, ASB_plan, init_princ, PTR_init, WACR, dt=1/12):
     """
     Get the CF of a CMBS.
 
@@ -873,8 +949,10 @@ def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
     """
     # err bound
     _err = 1e-2
+    # ignore divide by zero
+    _ = np.seterr(divide='ignore')
 
-    Npath, T = ADA.shape
+    Npath, T = ADA_init.shape
     Nasset = len(init_princ)
     
     # A-SB class
@@ -889,6 +967,10 @@ def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
     # Tranches with high/low-quality interests
     i_hiq_int = list(range(i_hiq)) + [i_XA, i_XB]
     i_loq_int = [_l for _l in range(Nasset) if _l not in i_hiq_int]
+    
+    # Expand pass through rate into matrix
+    PTR = np.repeat(PTR_init.reshape(1, -1), Npath, axis=0)
+    ADA = ADA_init.copy()
 
     # 3d_array:  path x n_of_asset x payment length
     cf_val = np.zeros((Npath, Nasset, T))
@@ -909,7 +991,7 @@ def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
         # Distribution amount (starting value) at each time
         _curr_DA = ADA[:, _t]
        
-       
+        
         ## Deal with default first ...
         for _i in reversed(range(i_hiq, Nasset)):
             _tranche_loss = np.minimum(curr_princ[:, _i], _curr_loss)
@@ -923,9 +1005,13 @@ def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
         # If after loss of all low quality tranches, still loss remaining,
         #  distribute to high quality tranches pro rata
         if any(_curr_loss > _err):
-            _tranche_loss = _curr_loss * \
-                np.divide(curr_princ[:, :i_hiq],
-                          curr_princ[:, :i_hiq].sum(axis=1).reshape((-1, 1)))
+            # Tranche loss, adjust for divide-by-zero
+            __wts = np.divide(curr_princ[:, :i_hiq], 
+                              curr_princ[:, :i_hiq].sum(axis=1).reshape((-1, 1)))
+            __wts[np.isinf(__wts)] = 0
+            __wts[np.isnan(__wts)] = 0
+            _tranche_loss = np.multiply(_curr_loss.reshape((-1, 1)), __wts)
+            
             curr_princ[:, :i_hiq] -= _tranche_loss
             # Now current loss should be 0
             _curr_loss -= _tranche_loss.sum(axis=1)
@@ -934,7 +1020,7 @@ def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
             
         # Update low quality tranche retirement indicator
         I_low_retire = curr_princ[:, i_hiq:].sum(axis=1) < _err
-        
+
         
         ## Now, distribute available payments
         # First, create artificial principal amount for X-A and X-B tranches
@@ -943,114 +1029,133 @@ def getCMBScashFlow(ADA, loss, ASB_plan, init_princ, PTR, WACR, dt=1/12):
         curr_princ[:, i_XB] = curr_princ[:, i_XB_classes].sum(axis=1)
         # rate for X-A and X-B are:
         #   weighted average mortgage rate - weighted average class pass-through class rate
-        PTR[i_XA] = WACR - \
-            np.divide(curr_princ[:, i_XA_classes],
-                      curr_princ[:, i_XA_classes].sum(axis=1).reshape((-1, 1))) \
-                .dot(PTR[i_XA_classes])
-        PTR[i_XB] = WACR - \
-            np.divide(curr_princ[:, i_XB_classes],
-                      curr_princ[:, i_XB_classes].sum(axis=1).reshape((-1, 1))) \
-                .dot(PTR[i_XB_classes])
-        # Clear principal amount of X-A and X-B
-        curr_princ[:, i_XA] = 0
-        curr_princ[:, i_XB] = 0
-          
-        
+        # adjust for divide-by-zero
+        __wts = np.divide(curr_princ[:, i_XA_classes], 
+                          curr_princ[:, i_XA_classes].sum(axis=1).reshape((-1, 1)))
+        __wts[np.isinf(__wts)] = 0
+        __wts[np.isnan(__wts)] = 0
+        PTR[:, i_XA] = np.maximum(0, WACR - __wts.dot(PTR[0, i_XA_classes]))
+        # adjust for divide-by-zero
+        __wts = np.divide(curr_princ[:, i_XB_classes],
+                          curr_princ[:, i_XB_classes].sum(axis=1).reshape((-1, 1)))
+        __wts[np.isinf(__wts)] = 0
+        __wts[np.isnan(__wts)] = 0
+        PTR[:, i_XB] = np.maximum(0, WACR - __wts.dot(PTR[0, i_XB_classes]))
+
+#        print(_curr_DA[0])
+#        print(curr_princ[0, i_hiq_int])
+#        print(PTR[0, i_hiq_int])
         ## Distribute interests of high quality tranches, pro rata
-        _int_hiq = np.multiply(PTR[i_hiq_int] * dt, curr_princ[:, i_hiq_int])
+        _int_hiq = dt * PTR[:, i_hiq_int] * curr_princ[:, i_hiq_int]
         _int_topay = np.minimum(_int_hiq.sum(axis=1), _curr_DA)
         # Adjust remaining distribution amount
         _curr_DA -= _int_topay
         # Keep track of payments
         cf_val[:, i_hiq_int, _t] += _int_hiq
-        
-        
+
+        # Clear principal amount of X-A and X-B
+        curr_princ[:, i_XA] = 0
+        curr_princ[:, i_XB] = 0
+
+
         ## Distribute principals of high quality tranches
         # If lower tranches all retired, distribute pro rata
-        _princ_sum = curr_princ[I_low_retire, :i_hiq].sum(axis=1)
-        _princ_topay = np.minimum(_princ_sum, _curr_DA[I_low_retire])
-        _princ_pmt = np.multiply(_princ_topay.reshape((-1, 1)),
-                                 np.divide(curr_princ[I_low_retire, :i_hiq],
-                                           _princ_sum.reshape((-1, 1))))
-        # Reduce principal amounts accordingly
-        curr_princ[I_low_retire, :i_hiq] -= _princ_pmt
-        # Keep track of payments
-        cf_val[I_low_retire, :i_hiq, _t] += _princ_pmt
-        # Adjust remaining distribution amount
-        _curr_DA[I_low_retire] -= _princ_topay
+        if I_low_retire.sum() > 0: # only if at least 1 path has low classes retired 
+            _princ_sum = curr_princ[I_low_retire, :i_hiq].sum(axis=1)
+            _princ_topay = np.minimum(_princ_sum, _curr_DA[I_low_retire])
+            
+            # Adjust for divide-by-zero
+            __wts = np.divide(curr_princ[I_low_retire, :i_hiq],
+                              _princ_sum.reshape((-1, 1)))
+            __wts[np.isinf(__wts)] = 0
+            __wts[np.isnan(__wts)] = 0
+            _princ_pmt = np.multiply(_princ_topay.reshape((-1, 1)), __wts)
+            
+            # Reduce principal amounts accordingly
+            curr_princ[I_low_retire, :i_hiq] -= _princ_pmt
+            # Keep track of payments
+            cf_val[I_low_retire, :i_hiq, _t] += _princ_pmt
+            # Adjust remaining distribution amount
+            _curr_DA[I_low_retire] -= _princ_topay
         
         # Otherwise (not all lower tranches retired), distribute in order
-        # First, A-SB tranche excess amount
-        _ASB_excess = np.maximum(0, curr_princ[~I_low_retire, i_ASB] - ASB_plan[_t])
-        _princ_topay = np.minimum(_ASB_excess, _curr_DA[~I_low_retire])
-        # Adjust remaining
-        curr_princ[~I_low_retire, i_ASB] -= _princ_topay
-        _curr_DA[~I_low_retire] -= _princ_topay
-        # Keep track payments
-        cf_val[~I_low_retire, i_ASB, _t] += _princ_topay
-        
-        # Then, for the rest of high quality tranches, in order
-        for _i in range(i_hiq):
-            _princ_topay = np.minimum(curr_princ[~I_low_retire, _i], _curr_DA[~I_low_retire])
+        if (~I_low_retire).sum() > 0: # only if some path has low classes not retired
+            # First, A-SB tranche excess amount
+            
+            _ASB_excess = np.maximum(0, curr_princ[~I_low_retire, i_ASB] - ASB_plan[_t])
+#            print(_ASB_excess)
+#            print(_curr_DA[~I_low_retire])  
+            _princ_topay = np.minimum(_ASB_excess, _curr_DA[~I_low_retire])
+
+            
             # Adjust remaining
-            curr_princ[~I_low_retire, _i] -= _princ_topay
+            curr_princ[~I_low_retire, i_ASB] -= _princ_topay
+            
             _curr_DA[~I_low_retire] -= _princ_topay
             # Keep track payments
-            cf_val[~I_low_retire, _i, _t] += _princ_topay
-
+            cf_val[~I_low_retire, i_ASB, _t] += _princ_topay
         
-        ## Reimburse top tranches principal loss up-to-date, pro rata
-        _loss_todate = np.maximum(0, loss_val[:, :i_hiq, :_t+1].sum(axis=2) - \
-                                     loss_reimb[:, :i_hiq, :_t+1].sum(axis=2))
-        _loss_sum = _loss_todate.sum(axis=1)
-        _loss_topay = np.minimum(_loss_sum, _curr_DA)
-        _loss_pmt = np.multiply(_loss_topay.reshape((-1, 1)),
-                                np.divide(_loss_todate, _loss_sum.reshape((-1, 1))))      
-        # Keep track of reimbursement and payments    
-        loss_reimb[:, :i_hiq, _t] += _loss_pmt
-        cf_val[:, :i_hiq, _t] += _loss_pmt
-        # Assume loss amounts are not written off the record, treat as cashflows  
-        # Adjust remaining distribution amount
-        _curr_DA -= _loss_topay
-
-
+            
+            
+            # Then, for the rest of high quality tranches, in order
+            for _i in range(i_hiq):
+                _princ_topay = np.minimum(curr_princ[~I_low_retire, _i], _curr_DA[~I_low_retire])
+                # Adjust remaining
+                curr_princ[~I_low_retire, _i] -= _princ_topay
+                _curr_DA[~I_low_retire] -= _princ_topay
+                # Keep track payments
+                cf_val[~I_low_retire, _i, _t] += _princ_topay
+        
+        
+        
+#        ## Reimburse top tranches principal loss up-to-date, pro rata
+#        _loss_todate = np.maximum(0, loss_val[:, :i_hiq, :_t+1].sum(axis=2) - \
+#                                     loss_reimb[:, :i_hiq, :_t+1].sum(axis=2))
+#        _loss_sum = _loss_todate.sum(axis=1)
+#        _loss_topay = np.minimum(_loss_sum, _curr_DA)
+#        
+#        # Adjust for divide-by-zero
+#        __wts = np.divide(_loss_todate, _loss_sum.reshape((-1, 1)))
+#        __wts[np.isinf(__wts)] = 0
+#        __wts[np.isnan(__wts)] = 0
+#
+#        _loss_pmt = np.multiply(_loss_topay.reshape((-1, 1)), __wts)
+#        
+#        # Keep track of reimbursement and payments    
+#        loss_reimb[:, :i_hiq, _t] += _loss_pmt
+#        cf_val[:, :i_hiq, _t] += _loss_pmt
+#        # Assume loss amounts are not written off the record, treat as cashflows  
+#        # Adjust remaining distribution amount
+#        _curr_DA -= _loss_topay
+        
+        
         ## Check whether available distribution amount is drained
-        if all(_curr_DA < _err):
-            # No more distribution, go directly to next time step
-            continue        
-        
-        
-        ## Distribute remaining to the rest of the low-quality tranches, in order
-        for _i in i_loq_int:
-            ## First, pay required interests
-            _int_topay = np.minimum(PTR[_i] * dt * curr_princ[:, _i], _curr_DA)
-            # Reduce DA and keep track payments
-            cf_val[:, _i, _t] += _int_topay
-            _curr_DA -= _int_topay
-            
-            ## Second, pay principal
-            _princ_topay = np.minimum(curr_princ[:, _i], _curr_DA)
-            # Reduce DA and keep track payments
-            cf_val[:, _i, _t] += _princ_topay
-            curr_princ[:, _i] -= _princ_topay
-            _curr_DA -= _princ_topay
-            
-            ## Third, reimburse previous principal loss
-            _loss_todate = np.maximum(0, loss_val[:, _i, :_t+1].sum(axis=2) - \
-                                         loss_reimb[:, _i, :_t+1].sum(axis=2))
-            _loss_topay = np.minimum(_loss_todate, _curr_DA)
-            # Reduce DA and keep track payments
-            loss_reimb[:, _i, _t] += _loss_topay
-            cf_val[:, _i, _t] += _loss_topay
-            _curr_DA -= _loss_topay
-            
-            ## Stop when no more available distribution amount
-            if all(_curr_DA < _err):
-                # Stop going down tranches
-                break
-        
+        if any(_curr_DA > _err):
+            ## Distribute remaining to the rest of the low-quality tranches, in order
+            for _i in i_loq_int:
+                ## First, pay required interests
+                _int_topay = np.minimum(PTR[0, _i] * dt * curr_princ[:, _i], _curr_DA)
+                # Reduce DA and keep track payments
+                cf_val[:, _i, _t] += _int_topay
+                _curr_DA -= _int_topay
+                
+                ## Second, pay principal
+                _princ_topay = np.minimum(curr_princ[:, _i], _curr_DA)
+                # Reduce DA and keep track payments
+                cf_val[:, _i, _t] += _princ_topay
+                curr_princ[:, _i] -= _princ_topay
+                _curr_DA -= _princ_topay
+                
+                ## Third, reimburse previous principal loss
+                _loss_todate = np.maximum(0, loss_val[:, _i, :_t+1].sum(axis=1) - \
+                                             loss_reimb[:, _i, :_t+1].sum(axis=1))
+                _loss_topay = np.minimum(_loss_todate, _curr_DA)
+                # Reduce DA and keep track payments
+                loss_reimb[:, _i, _t] += _loss_topay
+                cf_val[:, _i, _t] += _loss_topay
+                _curr_DA -= _loss_topay
         
         ## Update remaining principal amount at end of this time
         princ_val[:, :, _t] = curr_princ
 
-    return cf_val, loss_val, loss_reimb, princ_val
+    return cf_val, princ_val, loss_val, loss_reimb
